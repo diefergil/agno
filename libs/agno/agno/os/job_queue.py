@@ -1417,14 +1417,14 @@ class QueueWorker:
                     continue
                 with contextlib.suppress(Exception):
                     await event_stream.add_event(job_id, event, generation=stream_generation)
-            if final_output is None and is_workflow:
+            if final_output is None:
                 with contextlib.suppress(Exception):
                     final_output = await component.aget_run_output(
                         job_id, job["session_id"], user_id=job.get("user_id")
                     )
         finally:
-            # The final output may come from a DB read (workflows), where status
-            # round-trips as a plain str - coerce before the terminal write, or
+            # The final output may come from a DB read, where status round-trips
+            # as a plain str - coerce before the terminal write, or
             # complete_run dies inside this suppress and the stream never ends
             raw_status = getattr(final_output, "status", None)
             if isinstance(raw_status, str) and not isinstance(raw_status, RunStatus):
@@ -1436,7 +1436,11 @@ class QueueWorker:
                 # Cancellation propagating to the outer handler: the sentinel
                 # must say CANCELLED, not a coerced ERROR
                 raw_status = RunStatus.cancelled
-            status = raw_status if isinstance(raw_status, RunStatus) else RunStatus.error
+            status = (
+                raw_status
+                if raw_status in (RunStatus.completed, RunStatus.paused, RunStatus.cancelled, RunStatus.error)
+                else RunStatus.error
+            )
             # A retryable failure must NOT publish the terminal sentinel: tails
             # would close cleanly and the client would never see the retry's
             # output. Leave the stream open; the retry attempt continues it
@@ -2291,8 +2295,10 @@ class QueueWorker:
                     await self._asettle_ticket(job_id, attempt, "failed", error_content)
                 else:
                     await self._aretry_or_fail_ticket(job_id, attempt, error_content, self._retry_delay(attempt))
-            else:
+            elif status == RunStatus.completed:
                 await self._asettle_ticket(job_id, attempt, "completed")
+            else:
+                raise RuntimeError("Execution ended without a terminal run output")
         except asyncio.CancelledError:
             # Shutdown drain: the run was interrupted, not failed by its own
             # doing — requeue if budget remains, else fail visibly. When it

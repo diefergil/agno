@@ -467,6 +467,99 @@ class TestStreamingExecution:
         finally:
             es_mod._event_stream = original
 
+    @pytest.mark.parametrize("component_type", ["agent", "team"])
+    @pytest.mark.asyncio
+    async def test_streaming_reloads_missing_agent_and_team_terminal_output(self, monkeypatch, component_type):
+        """Agent and Team streams must recover the committed terminal run when their iterator omits it."""
+        import agno.os.event_streams as es_mod
+        from agno.job_queue.store import InMemoryQueueStore
+        from agno.os.event_streams import InMemoryEventStream
+        from agno.os.managers import EventsBuffer, SSESubscriberManager
+        from agno.run.base import RunStatus
+
+        stream = InMemoryEventStream(events_buffer=EventsBuffer(), subscriber_manager=SSESubscriberManager())
+        monkeypatch.setattr(es_mod, "_event_stream", stream)
+
+        class FakeComponent:
+            id = "component-1"
+            db = None
+
+            def __init__(self):
+                self.output_reads = 0
+
+            async def arun(self, **kwargs):
+                assert kwargs["yield_run_output"] is True
+                if False:
+                    yield None
+
+            async def aget_run_output(self, run_id, session_id, user_id=None):
+                self.output_reads += 1
+                return SimpleNamespace(run_id=run_id, session_id=session_id, status=RunStatus.completed)
+
+        component = FakeComponent()
+        worker = QueueWorker(
+            store=InMemoryQueueStore(),
+            resolve_component=lambda *_args: component,
+            config=QueueConfig(durable=True),
+        )
+        job = make_job("stream-recovered")
+        job.update(component_type=component_type, component_id=component.id)
+        job["payload"]["stream"] = True
+
+        result = await worker._execute_streaming(component, job)
+
+        assert result is not None and result.status is RunStatus.completed
+        assert component.output_reads == 1
+        assert await stream.get_run_status(job["id"]) is RunStatus.completed
+
+    @pytest.mark.parametrize(
+        "canonical_status",
+        [None, RunStatus.pending, RunStatus.running],
+        ids=["missing", "pending", "running"],
+    )
+    @pytest.mark.asyncio
+    async def test_streaming_nonterminal_or_missing_output_fails_ticket(self, monkeypatch, canonical_status):
+        """An incomplete stream must never settle successfully or publish a completed run."""
+        import agno.os.event_streams as es_mod
+        from agno.os.event_streams import InMemoryEventStream
+        from agno.os.managers import EventsBuffer, SSESubscriberManager
+
+        stream = InMemoryEventStream(events_buffer=EventsBuffer(), subscriber_manager=SSESubscriberManager())
+        monkeypatch.setattr(es_mod, "_event_stream", stream)
+
+        class FakeAgent:
+            id = "agent-1"
+            db = None
+
+            def __init__(self):
+                self.output_reads = 0
+
+            async def arun(self, **kwargs):
+                assert kwargs["yield_run_output"] is True
+                if False:
+                    yield None
+
+            async def aget_run_output(self, run_id, session_id, user_id=None):
+                self.output_reads += 1
+                if canonical_status is None:
+                    return None
+                return SimpleNamespace(run_id=run_id, session_id=session_id, status=canonical_status)
+
+        store = InMemoryQueueStore()
+        agent = FakeAgent()
+        job = make_job("stream-incomplete")
+        job["payload"]["stream"] = True
+        await store.enqueue_job(job)
+
+        worker = make_worker(store, agent, make_config())
+        claimed = await store.claim_job(worker.worker_id)
+        await worker._execute_claimed(claimed)
+
+        settled = await store.get_job(job["id"])
+        assert settled["status"] == "failed"
+        assert agent.output_reads == 1
+        assert await stream.get_run_status(job["id"]) is RunStatus.error
+
     @pytest.mark.asyncio
     async def test_streaming_retry_attempt_cleans_previous_stream(self):
         import agno.os.event_streams as es_mod
