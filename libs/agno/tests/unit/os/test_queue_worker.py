@@ -1002,19 +1002,20 @@ class TestSettlementResults:
     while the worker believes it finished."""
 
     @pytest.mark.asyncio
-    async def test_failed_settlement_is_loud_and_sweep_recoverable(self, caplog):
+    async def test_failed_settlement_is_loud_and_sweep_recoverable(self, monkeypatch):
         store, agent = InMemoryQueueStore(), FakeAgent()
         worker = make_worker(store, agent, make_config())
         await store.enqueue_job(make_job("r1"))
         claimed = await store.claim_job(worker.worker_id)
+        errors = []
 
         async def declining_complete(job_id, worker_id, attempt, status, error=None):
             return False  # e.g. the claim was reclaimed under us
 
         store.complete_job = declining_complete  # type: ignore[method-assign]
-        with caplog.at_level("ERROR"):
-            await worker._execute_claimed(claimed)
-        assert any("could not settle ticket" in r.message for r in caplog.records), (
+        monkeypatch.setattr("agno.os.job_queue.log_error", lambda message, *_args, **_kwargs: errors.append(message))
+        await worker._execute_claimed(claimed)
+        assert any("could not settle ticket" in message for message in errors), (
             "an unsettled ticket must be loud, never silent"
         )
         # The backstop: we stopped refreshing the lease, so the sweep collects it
@@ -1206,6 +1207,7 @@ class TestReservedKwargsParity:
                 async def arun(self, **kwargs):
                     assert kwargs["run_id"] == "rk1"
                     yield Ev()
+                    yield SimpleNamespace(run_id="rk1", status=RunStatus.completed)
 
             store = InMemoryQueueStore()
             await store.enqueue_job(
@@ -2481,6 +2483,174 @@ class TestTerminalRowClaim:
             f"an unreadable row must leave the claim stale for the sweep, got {job['status']!r} - "
             "never a manufactured terminal status"
         )
+
+
+class TestTerminalRefusalOnExecutionError:
+    @pytest.mark.parametrize("canonical_status", [RunStatus.completed, RunStatus.cancelled])
+    @pytest.mark.asyncio
+    async def test_terminal_row_wins_generic_stream_error(self, monkeypatch, canonical_status):
+        """A row committed before a stream error must decide ticket and SSE finality."""
+        import agno.os.event_streams as es_mod
+        from agno.os.event_streams import InMemoryEventStream
+        from agno.os.managers import EventsBuffer, SSESubscriberManager
+        from agno.run.status_persist import RunPersistOutcome
+
+        stream = InMemoryEventStream(events_buffer=EventsBuffer(), subscriber_manager=SSESubscriberManager())
+        monkeypatch.setattr(es_mod, "_event_stream", stream)
+
+        class FakeComponent:
+            id = "agent-1"
+            db = None
+
+            def __init__(self):
+                self.run_output = None
+
+            async def arun(self, **kwargs):
+                assert kwargs["stream"] is True
+                # Model a commit that succeeds before the stream transport
+                # raises while delivering the rest of the response.
+                self.run_output = SimpleNamespace(run_id="r1", status=canonical_status)
+                if False:
+                    yield None
+                raise RuntimeError("stream disconnected after commit")
+
+            async def aget_run_output(self, run_id, session_id, user_id=None):
+                assert (run_id, session_id) == ("r1", "s1")
+                return self.run_output
+
+        store = InMemoryQueueStore()
+        component = FakeComponent()
+        worker = QueueWorker(
+            store=store,
+            resolve_component=lambda *_args: component,
+            config=make_config(),
+            worker_id="live-worker",
+        )
+        persist_calls = []
+
+        async def refused_persist(job, error):
+            persist_calls.append((job["id"], error))
+            return RunPersistOutcome.TERMINAL_REFUSED
+
+        worker._persist_run_error_outcome = refused_persist  # type: ignore[method-assign]
+        job = make_job("r1")
+        job["payload"]["stream"] = True
+        await store.enqueue_job(job)
+        claimed = await store.claim_job(worker.worker_id)
+        await worker._execute_claimed(claimed)
+
+        ticket = await store.get_job("r1")
+        assert persist_calls == [("r1", "stream disconnected after commit")]
+        assert component.run_output.status is canonical_status
+        assert ticket["status"] == canonical_status.value.lower()
+        assert await stream.get_run_status("r1") is canonical_status
+
+    @pytest.mark.parametrize("readback", ["unreadable", "paused"])
+    @pytest.mark.asyncio
+    async def test_unresolved_terminal_refusal_leaves_claim_for_sweep(self, monkeypatch, readback):
+        """A failed read or PAUSED row is not permission to fail the ticket."""
+        import agno.os.event_streams as es_mod
+        from agno.os.event_streams import InMemoryEventStream
+        from agno.os.managers import EventsBuffer, SSESubscriberManager
+        from agno.run.status_persist import RunPersistOutcome
+
+        stream = InMemoryEventStream(events_buffer=EventsBuffer(), subscriber_manager=SSESubscriberManager())
+        monkeypatch.setattr(es_mod, "_event_stream", stream)
+
+        class FakeComponent:
+            id = "agent-1"
+            db = None
+            run_output = SimpleNamespace(run_id="r1", status=RunStatus.paused)
+
+            async def arun(self, **kwargs):
+                if False:
+                    yield None
+                raise RuntimeError("stream disconnected after commit")
+
+            async def aget_run_output(self, run_id, session_id, user_id=None):
+                if readback == "unreadable":
+                    raise RuntimeError("run store temporarily unavailable")
+                return self.run_output
+
+        store = InMemoryQueueStore()
+        component = FakeComponent()
+        worker = QueueWorker(
+            store=store,
+            resolve_component=lambda *_args: component,
+            config=make_config(),
+            worker_id="live-worker",
+        )
+
+        async def refused_persist(job, error):
+            return RunPersistOutcome.TERMINAL_REFUSED
+
+        worker._persist_run_error_outcome = refused_persist  # type: ignore[method-assign]
+        job = make_job("r1")
+        job["payload"]["stream"] = True
+        await store.enqueue_job(job)
+        claimed = await store.claim_job(worker.worker_id)
+        await worker._execute_claimed(claimed)
+
+        ticket = await store.get_job("r1")
+        assert ticket["status"] == "running"
+        assert ticket["locked_by"] == worker.worker_id
+        assert component.run_output.status is RunStatus.paused
+
+    @pytest.mark.asyncio
+    async def test_terminal_refusal_cannot_settle_a_newer_claim_or_stream(self, monkeypatch):
+        """The exact attempt CAS and stream generation fence protect a reclaim."""
+        import agno.os.event_streams as es_mod
+        from agno.os.event_streams import InMemoryEventStream
+        from agno.os.managers import EventsBuffer, SSESubscriberManager
+        from agno.run.status_persist import RunPersistOutcome
+
+        stream = InMemoryEventStream(events_buffer=EventsBuffer(), subscriber_manager=SSESubscriberManager())
+        monkeypatch.setattr(es_mod, "_event_stream", stream)
+
+        class FakeComponent:
+            id = "agent-1"
+            db = None
+            run_output = SimpleNamespace(run_id="r1", status=RunStatus.completed)
+
+            async def arun(self, **kwargs):
+                if False:
+                    yield None
+                raise RuntimeError("stream disconnected after commit")
+
+            async def aget_run_output(self, run_id, session_id, user_id=None):
+                return self.run_output
+
+        store = InMemoryQueueStore()
+        component = FakeComponent()
+        worker = QueueWorker(
+            store=store,
+            resolve_component=lambda *_args: component,
+            config=make_config(),
+            worker_id="old-worker",
+        )
+        job = make_job("r1", max_attempts=2)
+        job["payload"]["stream"] = True
+        await store.enqueue_job(job)
+        claimed = await store.claim_job(worker.worker_id)
+
+        # This permanent exception reaches the typed error path even though
+        # attempt 1 still has retry budget remaining.
+        worker._is_permanent_failure = lambda *_args: True  # type: ignore[method-assign]
+
+        async def refuse_after_reclaim(*_args, **_kwargs):
+            store._jobs["r1"].update(attempt=2, locked_by="new-worker", status="running")
+            await stream.begin_attempt("r1", 2)
+            await stream.set_run_status("r1", RunStatus.running, generation=2)
+            return RunPersistOutcome.TERMINAL_REFUSED
+
+        worker._persist_run_error_outcome = refuse_after_reclaim  # type: ignore[method-assign]
+        await worker._execute_claimed(claimed)
+
+        ticket = await store.get_job("r1")
+        assert ticket["status"] == "running"
+        assert ticket["attempt"] == 2
+        assert ticket["locked_by"] == "new-worker"
+        assert await stream.get_run_status("r1") is RunStatus.running
 
 
 class TestLocalWake:

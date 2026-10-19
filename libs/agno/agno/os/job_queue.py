@@ -1897,7 +1897,7 @@ class QueueWorker:
             )
             return
         ticket_status = normalized
-        await self._asettle_ticket(job_id, job["attempt"], ticket_status)
+        ticket_settled = await self._asettle_ticket(job_id, job["attempt"], ticket_status)
         with contextlib.suppress(Exception):
             from agno.os.event_streams import get_event_stream
 
@@ -1908,10 +1908,11 @@ class QueueWorker:
                     generation=job.get("attempt"),
                 )
             )
-        log_warning(
-            f"Job queue: claimed job {job_id} has a terminal run row ({row_status}); "
-            f"skipped execution and settled the ticket {ticket_status}"
-        )
+        if ticket_settled:
+            log_warning(
+                f"Job queue: claimed job {job_id} has a terminal run row ({row_status}); "
+                f"skipped execution and settled the ticket {ticket_status}"
+            )
 
     async def _afail_unbuildable(self, job: Dict[str, Any], target: UnbuildableComponent) -> None:
         """Terminalize (or retry) a run whose component cannot be built, with
@@ -2391,7 +2392,17 @@ class QueueWorker:
                 # - budget-exhausted jobs are re-swept; a permanent failure
                 # with budget left is re-claimed and fails permanently again
                 # until the persist lands or the budget exhausts into the sweep.
-                if not await self._persist_run_error(job, str(e)):
+                from agno.run.status_persist import RunPersistOutcome
+
+                outcome = await self._persist_run_error_outcome(job, str(e))
+                if outcome is RunPersistOutcome.TERMINAL_REFUSED:
+                    # A concurrent terminal write won. Re-read its status so
+                    # the ticket and stream follow the canonical row; if the
+                    # read is unavailable or non-terminal, leave the claim
+                    # for the sweep instead of manufacturing ERROR.
+                    await self._ahonor_terminal_row(component, job)
+                    return
+                if outcome is None:
                     log_error(
                         f"Job queue: could not persist run-row error for failed job {job_id}; "
                         "leaving it stale instead of terminalizing the ticket"
